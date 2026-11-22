@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<!--
+  tests/budget-push.html · 日常轻提醒：阈值判断与去重的测试
+  双击就能跑，不用 node / npm / 服务器。两件事保证它不会伤到你：
+  1) fetch 被换成一个只记账的假函数 —— 这一页一条真实请求都发不出去；
+  2) localStorage 被换成内存里的假对象 —— file:// 下面所有本地文件共用一份存储，
+     测试要是写进真的那份，你的账就没了。假存储装不上就直接停跑。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>慢慢记 · 日常轻提醒测试</title>
+<style>
+  body { font: 14px/1.75 system-ui, "Microsoft YaHei", sans-serif; background: #FAF7F2; color: #26332E; margin: 0; padding: 28px 18px 56px; }
+  .wrap { max-width: 800px; margin: 0 auto; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  .sub { color: #6C7A73; font-size: 12.5px; margin-bottom: 16px; }
+  .sum { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 16px; }
+  .chip { border: 1px solid #D8E0DA; background: #fff; border-radius: 999px; padding: 3px 11px; font-size: 12.5px; }
+  .chip.g { border-color: #9CCBBA; color: #1F7A5F; }
+  .chip.r { border-color: #E2A6A6; color: #A2413C; background: #FBEFF0; }
+  ol { list-style: none; padding: 0; margin: 0; }
+  li { background: #fff; border: 1px solid #E4EAE5; border-radius: 10px; padding: 9px 12px; margin-bottom: 7px; display: flex; gap: 10px; align-items: flex-start; }
+  li.r { border-color: #E2A6A6; background: #FBEFF0; }
+  .mk { font-weight: 700; flex: 0 0 auto; }
+  li.g .mk { color: #1F7A5F; }
+  li.r .mk { color: #A2413C; }
+  .t { flex: 1 1 auto; min-width: 0; }
+  .d { color: #6C7A73; font-size: 12px; word-break: break-all; }
+  .sec { font-size: 13px; color: #6C7A73; margin: 20px 0 8px; }
+  pre { background: #fff; border: 1px dashed #D8E0DA; border-radius: 10px; padding: 10px 12px; font-size: 11.5px; overflow: auto; white-space: pre-wrap; }
+  .stop { border: 1px solid #A2413C; background: #FBEFF0; color: #A2413C; border-radius: 8px; padding: 6px 12px; font-size: 12.5px; }
+  .btn { font: inherit; border: 1px solid #D8E0DA; background: #fff; border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>日常轻提醒 · 阈值判断与去重</h1>
+  <div class="sub">只测 js/notify.js 里那条 dailyBudget 规则和它的推送通道。跑完看有没有红条。</div>
+  <div id="gate"></div>
+  <div class="sum" id="sum"></div>
+  <div id="cases"></div>
+  <div class="sec">最后两次推送的原始请求（假 fetch 记下来的，没出网）</div>
+  <pre id="last">(还没有请求)</pre>
+  <div class="sec"><button class="btn" id="again" type="button">再跑一遍</button></div>
+</div>
+
+<script>
+/* 先把存储换成内存假货，装不上就停：不能拿用户的真账做实验 */
+window.__MEM__ = {};
+window.__REAL_LS__ = null;
+(function () {
+  try {
+    window.__REAL_LS__ = window.localStorage;
+    /* 先记下真数据长什么样，跑完再比一次：有任何差别就说明假存储没兜住 */
+    window.__REAL_BEFORE__ = window.__REAL_LS__.getItem("mmj.db.v1");
+    const fake = {
+      getItem: k => (Object.prototype.hasOwnProperty.call(window.__MEM__, k) ? window.__MEM__[k] : null),
+      setItem: (k, v) => { window.__MEM__[k] = String(v); },
+      removeItem: k => { delete window.__MEM__[k]; },
+      clear: () => { window.__MEM__ = {}; }
+    };
+    Object.defineProperty(window, "localStorage", { configurable: true, get: () => fake });
+    if (window.localStorage.getItem("nope") !== null) throw new Error("假存储没装上");
+  } catch (e) {
+    window.__LS_FAIL__ = String(e && e.message || e);
+  }
+})();
+</script>
+<script>
+/* 测试页自己也要能被诊断：任何没接住的报错都写到页面上，不然只剩一片空白 */
+window.addEventListener("error", e => showFail("脚本出错：" + (e.message || e) + "（" + (e.filename || "") + ":" + (e.lineno || "") + "）"));
+window.addEventListener("unhandledrejection", e => showFail("没接住的 Promise 错误：" + String((e.reason && e.reason.message) || e.reason)));
+function showFail(msg) {
+  const g = document.getElementById("gate");
+  if (g) g.insertAdjacentHTML("beforeend", '<div class="stop">' + msg + "</div>");
+}
+</script>
+<script>
+/* 环境变量的等价位置：测试从这里给值，代码里不该有写死的凭证 */
+window.APP_CONFIG = {
+  APP_TIMEZONE: "Asia/Shanghai",
+  PUSH_CHANNEL: "ntfy",
+  NTFY_BASE_URL: "",
+  NTFY_TOPIC: "mmj-unit-test-topic",
+  ENABLE_DAILY_BUDGET_PUSH: "",
+  BUDGET_ALERT_THRESHOLDS: "80,100",
+  BUDGET_PUSH_ON_WRITE: "false"   /* 用例自己决定什么时候求值，别让防抖抢跑 */
+};
+</script>
+<script src="../js/util.js"></script>
+<script src="../js/parse.js"></script>
+<script src="../js/store.js"></script>
+<script src="../js/engine.js"></script>
+<script src="../js/notify.js"></script>
+<script>
+(function () {
+  "use strict";
+  const gate = document.getElementById("gate");
+  if (window.__LS_FAIL__) {
+    gate.innerHTML = '<div class="stop">这台浏览器不让我替换 localStorage（' + U.esc(window.__LS_FAIL__) +
+      '）。为了不动你的真数据，测试不跑了。</div>';
+    return;
+  }
+
+  /* ---------- 假 fetch：只记账，不出网 ---------- */
+  let reqs = [], mode = "ok";
+  window.fetch = function (url, opt) {
+    const rec = { url: String(url), headers: (opt && opt.headers) || {}, body: String(opt && opt.body || "") };
+    reqs.push(rec);
+    if (mode === "boom") return Promise.reject(new Error("模拟断网"));
+    if (mode === "403") return Promise.resolve({ ok: false, status: 403 });
+    return Promise.resolve({ ok: true, status: 200 });
+  };
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const today = U.today();
+  const mk = U.monthKey(today);
+  const dim = U.daysInMonth(mk);
+  const day = U.round2(3000 / dim);              /* 今日预算：月预算 3000 摊到当月每天 */
+  /* 分类 id 是每次 wipe 重新生成的，只能在 reset 之后再取 */
+  let cat = null;
+  const KEY = t => ["dailyBudget", Store.data.activeBookId, today, t].join("|");
+  const spent = () => Notify.context().daySpent;
+  const skips = () => Store.notify.log.filter(x => x.skip);
+  const fails = () => Store.notify.log.filter(x => !x.ok && !x.skip);
+  /* 拿这笔备注当「不该出现在推送里的东西」的样本 */
+  const SECRET = "跟朋友吃了那家新开的";
+
+  /* 每个用例都从这份干净状态开始：月预算 3000、通道 ntfy、开关全开 */
+  async function reset(over) {
+    over = over || {};
+    window.APP_CONFIG.BUDGET_PUSH_ON_WRITE = "false";
+    /* 页面值和配置值会互相兜底：要模拟「根本没配通道」，两边都得清 */
+    window.APP_CONFIG.PUSH_CHANNEL = over.channel === undefined ? "ntfy" : over.channel;
+    Store.wipe();
+    cat = Store.catsOf("out").find(c => c.tag === "need");
+    Store.setSetting("onboarded", true);
+    Store.setSetting("monthlyIncome", 6000);
+    Store.setBudget(cat.id, over.budget === undefined ? 3000 : over.budget);
+    Store.setNotify({ enabled: over.enabled === false ? false : true });
+    Store.setNotifyChannel("phone", over.phone === false ? false : true);
+    Store.setNotifyChannel("inApp", !!over.inApp);
+    Store.setNotifyChannel("system", false);
+    Store.setNotifyPush({
+      channel: over.channel === undefined ? "ntfy" : over.channel,
+      ntfyTopic: over.topic || "", poToken: "", poUser: ""
+    });
+    Store.setBudgetPush({ enabled: over.bpOn !== false, thresholds: over.th || "" });
+    Store.clearNotifyLog();
+    reqs = []; mode = "ok";
+    await sleep(20);                               /* 让 Store 的防抖落进假存储 */
+  }
+  /* 记一笔然后求值：平时这步由 Store 的变更回调触发，用例里手动等它，好让断言稳定 */
+  async function pay(amount, note) {
+    Store.addTxn({ flow: "out", catId: cat.id, amount: amount, date: today, note: note || "午饭" });
+    return Notify.budgetScan();
+  }
+
+  const cases = [];
+  function t(name, fn, detail) { cases.push({ name, fn, detail }); }
+
+  /* ---------- 0 · 触发点：记账写入之后真的会重算 ---------- */
+  t("记完一笔账，不改任何东西也会自己重算并推出去", async () => {
+    await reset();
+    window.APP_CONFIG.BUDGET_PUSH_ON_WRITE = "true";
+    Store.addTxn({ flow: "out", catId: cat.id, amount: day * 0.8 + 1, date: today, note: "午饭" });
+    await sleep(700);
+    const n = reqs.length;
+    Store.addTxn({ flow: "out", catId: cat.id, amount: day, date: today, note: "晚饭" });
+    await sleep(700);
+    window.APP_CONFIG.BUDGET_PUSH_ON_WRITE = "false";
+    return n === 1 && reqs.length === 2;
+  }, "防抖 400ms：一次连续记五笔也只算一遍");
+
+  /* ---------- 1 · 算术：今日预算和阈值 ---------- */
+  t("今日预算 = 分类月预算之和 ÷ 当月天数", async () => {
+    await reset();
+    const all = Store.data.cats.filter(c => c.flow === "out").reduce((s, c) => s + (+Store.data.budgets[c.id] || 0), 0);
+    return all === 3000 && Notify.dayBudgetOf(mk) === day;
+  }, "3000 ÷ " + dim + " 天 = ¥" + U.money(day));
+
+  t("一分钱预算都没设 → 今日预算 0，原因里说清楚", async () => {
+    await reset({ budget: 0 });
+    return Notify.dayBudgetOf(mk) === 0 && /预算/.test(Notify.budgetBlock(Notify.context()));
+  });
+
+  t("阈值默认 80,100；脏值丢掉；页面上的值优先", async () => {
+    await reset();
+    const a = Notify.thresholdList().join(",") === "80,100";
+    Store.setBudgetPush({ thresholds: "100, 80,80, 0, -5, 999, abc" });
+    const b = Notify.thresholdList().join(",") === "80,100";
+    Store.setBudgetPush({ thresholds: "50,120" });
+    const c = Notify.thresholdList().join(",") === "50,120";
+    Store.setBudgetPush({ thresholds: "" });
+    return a && b && c && Notify.thresholdList().join(",") === "80,100";
+  }, "清空页面值 = 回落到配置里的 BUDGET_ALERT_THRESHOLDS");
+
+  t("转走 9999 进储蓄不算今日支出", async () => {
+    await reset();
+    const move = Store.catsOf("out").find(c => c.tag === "move");
+    Store.addTxn({ flow: "out", catId: move.id, amount: 9999, date: today, note: "存进定期" });
+    return spent() === 0;
+  }, "转移（存钱 / 还款）走的是另一条账，预算提醒只管消费");
+
+  /* ---------- 2 · 每一档只推一次 ---------- */
+  t("第一次跨过 80% 推一次，URL / 标题 / 优先级 / 文案都对", async () => {
+    await reset();
+    await pay(day * 0.8 + 1);
+    const r = reqs[0];
+    return reqs.length === 1 && r.url === "https://ntfy.sh/mmj-unit-test-topic" &&
+      r.headers.Title === "今日预算提醒" && r.headers.Priority === "3" &&
+      r.body === "今日预算提醒：今日支出 ¥" + U.money(spent()) + "，已用今日预算的 80%。";
+  }, "URL 由 NTFY_BASE_URL + NTFY_TOPIC 拼出来，代码里没有写死的地址");
+
+  t("涨到 95% 不会推第二遍", async () => {
+    await pay(day * 0.15);
+    return reqs.length === 1 && spent() > day * 0.9;
+  }, () => "今日已花 ¥" + U.money(spent()) + " / 预算 ¥" + U.money(day) + "，推送仍是 " + reqs.length + " 次");
+
+  t("跨过 100% 再推一次，用的是「超支」那句文案", async () => {
+    await pay(day);
+    const r = reqs[reqs.length - 1];
+    return reqs.length === 2 && r.headers.Title === "今日预算超支" && r.headers.Priority === "4" &&
+      r.body === "今日预算超支：今日支出 ¥" + U.money(spent()) + "，已超过今日预算 ¥" + U.money(day) + "。";
+  });
+
+  t("当天再记十笔也不刷屏", async () => {
+    for (let i = 0; i < 10; i++) await pay(50, "第" + i + "笔");
+    return reqs.length === 2;
+  }, () => "今日已花到 ¥" + U.money(spent()) + "，累计推送仍是 " + reqs.length + " 次");
+
+  t("删掉一笔再涨回来，不会重推已经推过的档", async () => {
+    const tx = Store.txns({ from: today, to: today });
+    const big = tx.reduce((a, b) => (b.amount > a.amount ? b : a), tx[0]);
+    Store.removeTxn(big.id);
+    await Notify.budgetScan();
+    const n = reqs.length;
+    await pay(big.amount);
+    return n === 2 && reqs.length === 2;
+  }, () => "删掉当天最大的一笔再原样记回来，推送仍是 " + reqs.length + " 次（去重键是「哪天 + 哪档」，跟金额无关）");
+
+  t("改一笔的金额也不会重推", async () => {
+    const t0 = Store.txns({ from: today, to: today })[0];
+    Store.updateTxn(t0.id, { flow: "out", catId: cat.id, amount: t0.amount + 500, date: today, note: t0.note });
+    await Notify.budgetScan();
+    return reqs.length === 2;
+  });
+
+  t("去重记录是持久化的：整轮重算、连跑三次都不重推", async () => {
+    const json = JSON.stringify(Store.notify.log.map(x => x.key));
+    for (let i = 0; i < 3; i++) await Notify.budgetScan();
+    await Notify.run({ force: true, limit: 9 });
+    return reqs.length === 2 && json.indexOf(KEY(80)) >= 0 && json.indexOf(KEY(100)) >= 0;
+  }, "两条去重键躺在发送日志里，跟着 .json 备份一起走");
+
+  t("换个账本，同一天同一档会再推（去重按账本分）", async () => {
+    const b = Store.addBook("测试账本", "🧪");
+    await Notify.budgetScan();
+    const before = reqs.length;
+    await pay(day * 2);
+    const ok = before === 2 && reqs.length === 4;
+    Store.useBook(Store.data.books.find(x => x.id !== b.id).id);
+    return ok;
+  }, "新账本自己还没推过，所以该推：这就是「同一用户 + 同一周期」的本地含义");
+
+  /* ---------- 3 · 开关与没配好：跳过而不是报错 ---------- */
+  t("页面开关关掉 → 不推，并说清为什么", async () => {
+    await reset({ bpOn: false });
+    await pay(day * 2);
+    const st = Notify.status().budget;
+    return reqs.length === 0 && st.on === false && /开关/.test(st.block);
+  }, () => "block = 「" + Notify.status().budget.block + "」");
+
+  t("ENABLE_DAILY_BUDGET_PUSH=false 是部署级硬关", async () => {
+    await reset();
+    window.APP_CONFIG.ENABLE_DAILY_BUDGET_PUSH = "false";
+    await pay(day * 2);
+    const hard = reqs.length === 0 && Notify.status().budget.on === false;
+    window.APP_CONFIG.ENABLE_DAILY_BUDGET_PUSH = "true";
+    await Notify.budgetScan();
+    const back = reqs.length === 2;
+    window.APP_CONFIG.ENABLE_DAILY_BUDGET_PUSH = "";
+    return hard && back;
+  }, "改回 true 之后，同一轮就把该推的两档补上");
+
+  t("规则在「提什么」里关掉 → 不推也不留一行痕", async () => {
+    await reset();
+    Store.setNotifyRule("dailyBudget", false);
+    await pay(day * 2);
+    return reqs.length === 0 && skips().length === 0;
+  });
+
+  t("没选推送方式 → 0 请求 + 记下原因 + 不进重试队列", async () => {
+    await reset({ channel: "" });
+    await pay(day * 2);
+    const s = skips();
+    return reqs.length === 0 && s.length === 1 && /没选推送方式/.test(s[0].skip) &&
+      s[0].ok === false && Store.notify.pending.length === 0;
+  }, () => "原因：「" + (skips()[0] || {}).skip + "」");
+
+  t("选了 ntfy 但没填 topic → 0 请求 + 原因里点名 topic", async () => {
+    await reset({ channel: "ntfy", topic: "" });
+    window.APP_CONFIG.NTFY_TOPIC = "";
+    await pay(day * 2);
+    const s = skips();
+    window.APP_CONFIG.NTFY_TOPIC = "mmj-unit-test-topic";
+    return reqs.length === 0 && s.length === 1 && /topic/.test(s[0].skip);
+  });
+
+  t("没设预算 → 0 请求 + 一行原因 + 不抛错", async () => {
+    await reset({ budget: 0 });
+    let err = "";
+    try { await pay(day * 2); } catch (e) { err = String(e.message || e); }
+    return err === "" && reqs.length === 0 && /预算/.test((skips()[0] || {}).skip || "");
+  });
+
+  t("同一种原因一天只记一条", async () => {
+    await reset({ channel: "" });
+    for (let i = 0; i < 4; i++) await pay(10);
+    return reqs.length === 0 && skips().length === 1;
+  });
+
+  t("压根没打算用推送的人，日志里不会冒出「没推」", async () => {
+    await reset({ channel: "", phone: false });
+    await pay(day * 2);
+    return skips().length === 0 && reqs.length === 0;
+  }, "跳过是正常状态，只对已经动过这条通道的人解释原因");
+
+  t("提醒总开关（notify.enabled）关掉时也不出网", async () => {
+    await reset({ enabled: false });
+    await pay(day * 2);
+    return reqs.length === 0 && /总开关/.test(Notify.status().budget.block);
+  });
+
+  /* ---------- 4 · 只走手机通道 ---------- */
+  t("预算提醒只走手机：不堆横幅、不去抢别的通道", async () => {
+    await reset({ inApp: true });
+    await pay(day * 2);
+    return reqs.length === 2 && (Store.notify.state.banners || []).length === 0;
+  }, "到线推 2 条、横幅 0 条 —— 不然记一笔就叠三条");
+
+  /* ---------- 5 · 失败、重试、不干扰记账 ---------- */
+  t("发送失败：一行错误日志 + 一个待重试，账照样写进库", async () => {
+    await reset();
+    mode = "boom";
+    const r = await pay(day * 0.8 + 1);
+    const f = fails();
+    return r.failed === 1 && f.length === 1 && /模拟断网/.test(f[0].error) &&
+      f[0].tries === 1 && Store.notify.pending.length === 1 && spent() > day * 0.8;
+  }, () => "推送坏了不影响这笔账：今日支出已经是 ¥" + U.money(spent()) + "，待重试 " + Store.notify.pending.length + " 条");
+
+  t("恢复之后重试会真的补发，并把队列清空", async () => {
+    const key = Store.notify.pending[0] && Store.notify.pending[0].key;
+    mode = "ok";
+    Store.setNotifyPending(Store.notify.pending.map(p => Object.assign(p, { nextAt: 0 })));
+    await Notify.pump();
+    return !!key && Store.notify.pending.length === 0 && Store.notifySent(key) === true && reqs.length === 2;
+  }, "第 2 次成功 → 去重记上、队列清空");
+
+  t("一直失败就到上限：试满 " + Notify.MAX_TRIES + " 次写「已放弃」，不再堆队列", async () => {
+    await reset();
+    mode = "boom";
+    await pay(day * 0.8 + 1);
+    for (let i = 0; i < Notify.MAX_TRIES; i++) {
+      Store.setNotifyPending(Store.notify.pending.map(p => Object.assign(p, { nextAt: 0 })));
+      await Notify.pump();
+    }
+    return Store.notify.pending.length === 0 &&
+      Store.notify.log.some(x => /已放弃/.test(x.error || "")) &&
+      reqs.length === Notify.MAX_TRIES;
+  }, "一共试过 " + Notify.MAX_TRIES + " 次（间隔递增），之后不再纠缠");
+
+  t("ntfy 回 403 时说清 topic 可能被人占了", async () => {
+    await reset();
+    mode = "403";
+    await pay(day * 0.8 + 1);
+    const f = fails()[0] || {};
+    mode = "ok";
+    return /403/.test(f.error || "") && /topic/.test(f.error || "");
+  });
+
+  /* ---------- 6 · 凭证与内容 ---------- */
+  t("Pushover 那条路读的是配置，不是写死的", async () => {
+    await reset({ channel: "pushover", topic: "" });
+    window.APP_CONFIG.PUSHOVER_TOKEN = "from-config-token";
+    window.APP_CONFIG.PUSHOVER_USER_KEY = "from-config-user";
+    await pay(day * 2);
+    const r = reqs[reqs.length - 1] || {};
+    const ok = r.url === "https://api.pushover.net/1/messages.json" &&
+      /token=from-config-token/.test(r.body) && /user=from-config-user/.test(r.body);
+    delete window.APP_CONFIG.PUSHOVER_TOKEN;
+    delete window.APP_CONFIG.PUSHOVER_USER_KEY;
+    return ok;
+  }, "换一组值，发出去的就跟着变 —— 说明值只可能来自配置");
+
+  t("推送里没有分类名、备注和任何一笔流水", async () => {
+    await reset();
+    await pay(day * 2, SECRET);
+    const all = reqs.map(r => r.url + " " + JSON.stringify(r.headers) + " " + r.body).join(" | ");
+    return all.indexOf(SECRET) < 0 && all.indexOf(cat.name) < 0 && all.indexOf(cat.emoji) < 0;
+  }, () => "整条请求里搜不到备注「" + SECRET + "」，也搜不到分类名「" + cat.name + "」");
+
+  t("设备编号只生成一次，之后所有推送共用它", async () => {
+    const a = Notify.pushUser();
+    const b = Notify.pushUser();
+    return a === b && /^u_/.test(a) && Store.notify.push.userId === a;
+  }, "后端版这里是用户主键；本地版用它当「同一用户」");
+
+  /* ---------- 跑 ---------- */
+  (async function () {
+    const out = [];
+    /* 每跑完一条就画一次：卡住的时候能一眼看出停在哪条 */
+    function paint(done) {
+      const pass = out.filter(x => x.ok).length;
+      document.getElementById("sum").innerHTML =
+        '<span class="chip ' + (done && pass === out.length ? "g" : "r") + '">通过 ' + pass + " / " + out.length +
+        (done ? "" : "（已跑完 " + out.length + " 条）") + "</span>" +
+        '<span class="chip">假 fetch 共收到 ' + reqs.length + " 次调用</span>";
+      document.getElementById("cases").innerHTML = "<ol>" + out.map(x => `<li class="${x.ok ? "g" : "r"}">
+        <span class="mk">${x.ok ? "✓" : "✗"}</span>
+        <span class="t"><b>${U.esc(x.name)}</b><br><span class="d">${U.esc(x.detail)}</span></span></li>`).join("") + "</ol>";
+    }
+    for (const c of cases) {
+      let ok = false, err = "";
+      try { ok = (await c.fn()) === true; } catch (e) { ok = false; err = String(e && e.message || e); }
+      let d = "";
+      try { d = typeof c.detail === "function" ? c.detail() : (c.detail || ""); } catch (e) { d = String(e.message || e); }
+      out.push({ name: c.name, detail: d + (err ? "　→ 报错：" + err : ""), ok });
+      paint(false);
+    }
+    const pass = out.filter(x => x.ok).length;
+    /* 假存储要是没兜住，真的那份会被改动 —— 前后各取一次原文来比对 */
+    let untouched = true;
+    try { untouched = window.__REAL_LS__.getItem("mmj.db.v1") === window.__REAL_BEFORE__; } catch (e) { untouched = false; }
+    document.getElementById("sum").innerHTML =
+      '<span class="chip ' + (pass === out.length ? "g" : "r") + '">通过 ' + pass + " / " + out.length + "</span>" +
+      '<span class="chip">假 fetch 共收到 ' + reqs.length + " 次调用</span>" +
+      '<span class="chip ' + (untouched ? "g" : "r") + '">' + (untouched ? "真数据没被写过" : "⚠ 真的那份存储被动过") + "</span>" +
+      '<span class="chip">今日预算 ¥' + U.money(day) + "（3000 ÷ " + dim + " 天）</span>";
+    document.getElementById("cases").innerHTML = "<ol>" + out.map(x => `<li class="${x.ok ? "g" : "r"}">
+        <span class="mk">${x.ok ? "✓" : "✗"}</span>
+        <span class="t"><b>${U.esc(x.name)}</b><br><span class="d">${U.esc(x.detail)}</span></span></li>`).join("") + "</ol>";
+    const last = reqs.slice(-2);
+    document.getElementById("last").textContent = last.length
+      ? last.map(r => "POST " + r.url + "\n" + JSON.stringify(r.headers) + "\n" + r.body).join("\n\n——\n\n")
+      : "(没有请求)";
+  })();
+
+  document.getElementById("again").addEventListener("click", () => location.reload());
+})();
+</script>
+</body>
+</html>
